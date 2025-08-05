@@ -42,13 +42,12 @@ class Job(BaseModel):
     num_inference_steps: int = 50
     true_cfg_scale: float = 4.0
     seed: int
-    filename: Optional[str] = None
+    number: int = 1
     status: JobStatus = JobStatus.QUEUED
     created_at: datetime
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     error_message: Optional[str] = None
-    output_filename: Optional[str] = None
 
 class GenerationRequest(BaseModel):
     prompt: str
@@ -57,7 +56,6 @@ class GenerationRequest(BaseModel):
     num_inference_steps: int = 50
     true_cfg_scale: float = 4.0
     seed: int
-    filename: Optional[str] = None
     number: int = 1
 
 class StatusResponse(BaseModel):
@@ -131,14 +129,6 @@ def _cuda_worker_thread(job_queue: deque, completed_jobs: deque, app_state: Dict
             logger.info("Processing job %s: %s...", job.id, job.prompt[:50])
             
             try:
-                # Determine filename and increment counter atomically
-                if job.filename:
-                    filename = job.filename
-                else:
-                    current_num = app_state["next_image_num"]
-                    app_state["next_image_num"] += 1
-                    filename = f"images/img{current_num:04d}.png"
-                
                 # Aspect ratio mapping
                 aspect_ratios = {
                     "1:1": (1328, 1328),
@@ -152,33 +142,44 @@ def _cuda_worker_thread(job_queue: deque, completed_jobs: deque, app_state: Dict
                     raise ValueError(f"Unsupported aspect ratio: {job.aspect_ratio}")
                 
                 width, height = aspect_ratios[job.aspect_ratio]
-                
                 positive_magic = "Ultra HD, 4K, cinematic composition."
                 full_prompt = f"{job.prompt} {positive_magic}"
                 
-                generator = torch.Generator(device=device).manual_seed(job.seed)
-                
-                # Generate image
-                image = pipeline(
-                    prompt=full_prompt,
-                    negative_prompt=job.negative_prompt,
-                    width=width,
-                    height=height,
-                    num_inference_steps=job.num_inference_steps,
-                    true_cfg_scale=job.true_cfg_scale,
-                    generator=generator
-                ).images[0]
-                
-                # Save image to disk
-                os.makedirs(os.path.dirname(filename), exist_ok=True)
-                image.save(filename)
+                # Generate N images for this job
+                for i in range(job.number):
+                    # Auto-generate filename and increment counter atomically
+                    current_num = app_state["next_image_num"]
+                    app_state["next_image_num"] += 1
+                    filename = f"images/img{current_num:04d}.png"
+                    
+                    # Use incremental seeds for multiple images
+                    current_seed = job.seed + i
+                    generator = torch.Generator(device=device).manual_seed(current_seed)
+                    
+                    logger.debug("Generating image %d/%d with seed %d", i + 1, job.number, current_seed)
+                    
+                    # Generate image
+                    image = pipeline(
+                        prompt=full_prompt,
+                        negative_prompt=job.negative_prompt,
+                        width=width,
+                        height=height,
+                        num_inference_steps=job.num_inference_steps,
+                        true_cfg_scale=job.true_cfg_scale,
+                        generator=generator
+                    ).images[0]
+                    
+                    # Save image to disk
+                    os.makedirs(os.path.dirname(filename), exist_ok=True)
+                    image.save(filename)
+                    
+                    logger.debug("Saved image %d/%d: %s", i + 1, job.number, filename)
                 
                 # Mark job as completed
                 job.status = JobStatus.COMPLETED
                 job.completed_at = datetime.now()
-                job.output_filename = filename
                 
-                logger.info("Job %s completed: %s", job.id, filename)
+                logger.info("Job %s completed: generated %d image%s", job.id, job.number, 's' if job.number > 1 else '')
                 
             except Exception as e:
                 job.status = JobStatus.FAILED
@@ -261,7 +262,7 @@ async def get_status():
             "id": job.id,
             "prompt": job.prompt[:50] + "..." if len(job.prompt) > 50 else job.prompt,
             "status": job.status,
-            "output_filename": job.output_filename,
+            "number": job.number,
             "completed_at": job.completed_at.isoformat() if job.completed_at else None,
             "error_message": job.error_message
         })
@@ -282,33 +283,30 @@ async def generate_image(request: GenerationRequest):
     if not app.state.shared_state.get("cuda_ready", False):
         raise HTTPException(status_code=HTTPStatus.SERVICE_UNAVAILABLE, detail="Model not loaded")
     
-    # Create N jobs
-    jobs_created = 0
-    for i in range(request.number):
-        job = Job(
-            id=str(uuid.uuid4()),
-            prompt=request.prompt,
-            negative_prompt=request.negative_prompt,
-            aspect_ratio=request.aspect_ratio,
-            num_inference_steps=request.num_inference_steps,
-            true_cfg_scale=request.true_cfg_scale,
-            seed=request.seed,
-            filename=request.filename,
-            created_at=datetime.now()
-        )
-        
-        # Add to queue
-        app.state.job_queue.append(job)
-        jobs_created += 1
+    # Create single job for N images
+    job = Job(
+        id=str(uuid.uuid4()),
+        prompt=request.prompt,
+        negative_prompt=request.negative_prompt,
+        aspect_ratio=request.aspect_ratio,
+        num_inference_steps=request.num_inference_steps,
+        true_cfg_scale=request.true_cfg_scale,
+        seed=request.seed,
+        number=request.number,
+        created_at=datetime.now()
+    )
     
-    logger.debug("Queued %d job%s: %s... (Queue length: %d)", 
-                 jobs_created, 's' if jobs_created > 1 else '', 
+    # Add to queue
+    app.state.job_queue.append(job)
+    
+    logger.debug("Queued job for %d image%s: %s... (Queue length: %d)", 
+                 request.number, 's' if request.number > 1 else '', 
                  request.prompt[:50], len(app.state.job_queue))
     
     return GenerationResponse(
         success=True,
-        jobs_created=jobs_created,
-        message=f"{jobs_created} job{'s' if jobs_created > 1 else ''} queued successfully. Queue length: {len(app.state.job_queue)}"
+        jobs_created=1,
+        message=f"Job queued for {request.number} image{'s' if request.number > 1 else ''}. Queue length: {len(app.state.job_queue)}"
     )
 
 @click.group()
@@ -337,13 +335,12 @@ def server(host: str, port: int):
 @click.argument('prompt')
 @click.option('--host', default=DEFAULT_HOST, help='Server host')
 @click.option('--port', default=DEFAULT_PORT, help='Server port')
-@click.option('--filename', help='Output filename (auto-generated if not provided)')
 @click.option('--aspect-ratio', default='16:9', help='Image aspect ratio')
 @click.option('--steps', default=50, help='Number of inference steps')
 @click.option('--cfg-scale', default=4.0, help='CFG scale')
 @click.option('--seed', default=None, type=int, help='Random seed (random if not specified)')
 @click.option('-n', '--number', default=1, help='Number of images to generate')
-def generate(prompt: str, host: str, port: int, filename: Optional[str], aspect_ratio: str, 
+def generate(prompt: str, host: str, port: int, aspect_ratio: str, 
             steps: int, cfg_scale: float, seed: Optional[int], number: int):
     """Generate image using the server"""
     server_url = f"http://{host}:{port}"
@@ -372,7 +369,6 @@ def generate(prompt: str, host: str, port: int, filename: Optional[str], aspect_
                 "num_inference_steps": steps,
                 "true_cfg_scale": cfg_scale,
                 "seed": seed,
-                "filename": filename,
                 "number": number
             }
             
@@ -432,7 +428,7 @@ def status(host: str, port: int):
                     status_symbol = "[OK]" if job['status'] == 'completed' else "[FAIL]"
                     click.echo(f"  {status_symbol} {job['id']}: {job['prompt']}")
                     if job['status'] == 'completed':
-                        click.echo(f"    -> {job['output_filename']}")
+                        click.echo(f"    -> Generated {job['number']} image{'s' if job['number'] > 1 else ''}")
                     elif job['error_message']:
                         click.echo(f"    -> Error: {job['error_message']}")
                         
