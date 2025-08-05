@@ -4,12 +4,15 @@ import re
 import sys
 import uuid
 import asyncio
+import threading
+import logging
 from collections import deque
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any
 from datetime import datetime
 from enum import Enum
 from http import HTTPStatus
+from concurrent.futures import ThreadPoolExecutor
 import torch
 import click
 import httpx
@@ -17,6 +20,8 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from diffusers import DiffusionPipeline
+
+logger = logging.getLogger(__name__)
 
 MODEL_NAME = "Qwen/Qwen-Image"
 DEFAULT_PORT = 8000
@@ -81,33 +86,56 @@ def scan_for_max_image_number(directory: str = "images") -> int:
             max_num = max(max_num, int(match.group(1)))
     return max_num
 
-async def process_job_queue(app: FastAPI):
-    """Background task to process the job queue"""
-    while True:
-        try:
-            if not hasattr(app.state, 'job_queue') or len(app.state.job_queue) == 0:
-                await asyncio.sleep(1)
+def _cuda_worker_thread(job_queue: deque, completed_jobs: deque, app_state: Dict[str, Any]):
+    """CUDA worker thread - owns all GPU resources and operations"""
+    try:
+        # Load pipeline in this thread
+        if torch.cuda.is_available():
+            torch_dtype = torch.bfloat16
+            device = "cuda"
+        else:
+            torch_dtype = torch.float32
+            device = "cpu"
+        
+        logger.info("Loading model on %s in worker thread...", device)
+        pipeline = DiffusionPipeline.from_pretrained(
+            MODEL_NAME,
+            torch_dtype=torch_dtype,
+            cache_dir="./model_cache"
+        )
+        pipeline = pipeline.to(device)
+        logger.info("Model loaded successfully on %s in worker thread!", device)
+        
+        # Signal main thread that we're ready
+        app_state["cuda_ready"] = True
+        app_state["device"] = device
+        
+        # Process jobs forever
+        while not app_state.get("shutdown", False):
+            if len(job_queue) == 0:
+                threading.Event().wait(0.1)  # Small sleep
                 continue
             
-            if not hasattr(app.state, 'pipeline') or app.state.pipeline is None:
-                await asyncio.sleep(1)
+            # Get next job (thread-safe pop)
+            try:
+                job = job_queue.popleft()
+            except IndexError:
                 continue
             
-            # Get next job
-            job = app.state.job_queue.popleft()
-            app.state.current_job = job
+            # Update job status
             job.status = JobStatus.PROCESSING
             job.started_at = datetime.now()
+            app_state["current_job"] = job
             
-            print(f"Processing job {job.id}: {job.prompt[:50]}...")
+            logger.info("Processing job %s: %s...", job.id, job.prompt[:50])
             
             try:
-                # Determine filename and increment counter
+                # Determine filename and increment counter atomically
                 if job.filename:
                     filename = job.filename
                 else:
-                    current_num = app.state.next_image_num
-                    app.state.next_image_num += 1
+                    current_num = app_state["next_image_num"]
+                    app_state["next_image_num"] += 1
                     filename = f"images/img{current_num:04d}.png"
                 
                 # Aspect ratio mapping
@@ -127,9 +155,10 @@ async def process_job_queue(app: FastAPI):
                 positive_magic = "Ultra HD, 4K, cinematic composition."
                 full_prompt = f"{job.prompt} {positive_magic}"
                 
-                generator = torch.Generator(device=app.state.device).manual_seed(job.seed)
+                generator = torch.Generator(device=device).manual_seed(job.seed)
                 
-                image = app.state.pipeline(
+                # Generate image
+                image = pipeline(
                     prompt=full_prompt,
                     negative_prompt=job.negative_prompt,
                     width=width,
@@ -148,69 +177,64 @@ async def process_job_queue(app: FastAPI):
                 job.completed_at = datetime.now()
                 job.output_filename = filename
                 
-                print(f"Job {job.id} completed: {filename}")
+                logger.info("Job %s completed: %s", job.id, filename)
                 
             except Exception as e:
                 job.status = JobStatus.FAILED
                 job.completed_at = datetime.now()
                 job.error_message = str(e)
-                print(f"Job {job.id} failed: {e}")
+                logger.exception("Job %s failed", job.id)
             
             # Move to completed jobs (keep last 10)
-            if not hasattr(app.state, 'completed_jobs'):
-                app.state.completed_jobs = deque(maxlen=10)
-            app.state.completed_jobs.append(job)
-            app.state.current_job = None
+            completed_jobs.append(job)
+            app_state["current_job"] = None
             
-        except Exception as e:
-            print(f"Error in job processing: {e}")
-            await asyncio.sleep(1)
+    except Exception as e:
+        logger.exception("Worker thread failed")
+        app_state["cuda_ready"] = False
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Load pipeline and initialize state
-    if torch.cuda.is_available():
-        torch_dtype = torch.bfloat16
-        device = "cuda"
-    else:
-        torch_dtype = torch.float32
-        device = "cpu"
-    
-    print(f"Loading model on {device}...")
-    pipeline = DiffusionPipeline.from_pretrained(
-        MODEL_NAME,
-        torch_dtype=torch_dtype,
-        cache_dir="./model_cache"
-    )
-    pipeline = pipeline.to(device)
-    print("Model loaded successfully and staying in memory!")
-    
-    # Initialize file counter
+    # Initialize shared state
     os.makedirs("images", exist_ok=True)
     max_num = scan_for_max_image_number("images")
     
-    # Store in app state
-    app.state.pipeline = pipeline
-    app.state.device = device
-    app.state.next_image_num = max_num + 1
-    app.state.job_queue = deque()
-    app.state.current_job = None
-    app.state.completed_jobs = deque(maxlen=10)
+    # Thread-safe collections and shared state
+    job_queue = deque()
+    completed_jobs = deque(maxlen=10)
+    shared_state = {
+        "next_image_num": max_num + 1,
+        "cuda_ready": False,
+        "device": None,
+        "current_job": None,
+        "shutdown": False
+    }
     
-    print(f"Next image will be: img{app.state.next_image_num:04d}.png")
+    logger.info("Next image will be: img%04d.png", shared_state['next_image_num'])
     
-    # Start background job processor
-    job_processor_task = asyncio.create_task(process_job_queue(app))
+    # Store in app state for FastAPI endpoints
+    app.state.job_queue = job_queue
+    app.state.completed_jobs = completed_jobs
+    app.state.shared_state = shared_state
+    
+    # Start CUDA worker thread
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cuda-worker")
+    cuda_future = executor.submit(_cuda_worker_thread, job_queue, completed_jobs, shared_state)
+    
+    # Wait for CUDA thread to signal readiness
+    logger.info("Waiting for worker thread to load model...")
+    while not shared_state.get("cuda_ready", False):
+        await asyncio.sleep(0.1)
+    
+    logger.info("Worker thread ready!")
     
     yield
     
-    # Shutdown: cleanup
-    job_processor_task.cancel()
-    try:
-        await job_processor_task
-    except asyncio.CancelledError:
-        pass
-    app.state.pipeline = None
+    # Shutdown: stop CUDA worker thread
+    logger.info("Shutting down worker thread...")
+    shared_state["shutdown"] = True
+    executor.shutdown(wait=True)
 
 # FastAPI app with lifespan
 app = FastAPI(title="Qwen Image Generator", version="0.1.0", lifespan=lifespan)
@@ -218,34 +242,35 @@ app = FastAPI(title="Qwen Image Generator", version="0.1.0", lifespan=lifespan)
 @app.get("/status", response_model=StatusResponse)
 async def get_status():
     """Get server status including queue information"""
+    shared_state = app.state.shared_state
+    
     current_job_info = None
-    if hasattr(app.state, 'current_job') and app.state.current_job:
-        job = app.state.current_job
+    current_job = shared_state.get("current_job")
+    if current_job:
         current_job_info = {
-            "id": job.id,
-            "prompt": job.prompt[:100] + "..." if len(job.prompt) > 100 else job.prompt,
-            "started_at": job.started_at.isoformat() if job.started_at else None,
-            "status": job.status
+            "id": current_job.id,
+            "prompt": current_job.prompt[:100] + "..." if len(current_job.prompt) > 100 else current_job.prompt,
+            "started_at": current_job.started_at.isoformat() if current_job.started_at else None,
+            "status": current_job.status
         }
     
     recent_completed = []
-    if hasattr(app.state, 'completed_jobs'):
-        for job in list(app.state.completed_jobs)[-5:]:  # Last 5 completed jobs
-            recent_completed.append({
-                "id": job.id,
-                "prompt": job.prompt[:50] + "..." if len(job.prompt) > 50 else job.prompt,
-                "status": job.status,
-                "output_filename": job.output_filename,
-                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
-                "error_message": job.error_message
-            })
+    for job in list(app.state.completed_jobs)[-5:]:  # Last 5 completed jobs
+        recent_completed.append({
+            "id": job.id,
+            "prompt": job.prompt[:50] + "..." if len(job.prompt) > 50 else job.prompt,
+            "status": job.status,
+            "output_filename": job.output_filename,
+            "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            "error_message": job.error_message
+        })
     
     return StatusResponse(
         status="running",
-        ready=hasattr(app.state, 'pipeline') and app.state.pipeline is not None,
-        model_loaded=hasattr(app.state, 'pipeline') and app.state.pipeline is not None,
-        next_image_num=getattr(app.state, 'next_image_num', 0),
-        queue_length=len(getattr(app.state, 'job_queue', [])),
+        ready=shared_state.get("cuda_ready", False),
+        model_loaded=shared_state.get("cuda_ready", False),
+        next_image_num=shared_state.get("next_image_num", 0),
+        queue_length=len(app.state.job_queue),
         current_job=current_job_info,
         recent_completed=recent_completed
     )
@@ -253,7 +278,7 @@ async def get_status():
 @app.post("/generate", response_model=GenerationResponse)
 async def generate_image(request: GenerationRequest):
     """Queue image generation job(s)"""
-    if not hasattr(app.state, 'pipeline') or app.state.pipeline is None:
+    if not app.state.shared_state.get("cuda_ready", False):
         raise HTTPException(status_code=HTTPStatus.SERVICE_UNAVAILABLE, detail="Model not loaded")
     
     # Create N jobs
@@ -275,7 +300,9 @@ async def generate_image(request: GenerationRequest):
         app.state.job_queue.append(job)
         jobs_created += 1
     
-    print(f"Queued {jobs_created} job{'s' if jobs_created > 1 else ''}: {request.prompt[:50]}... (Queue length: {len(app.state.job_queue)})")
+    logger.debug("Queued %d job%s: %s... (Queue length: %d)", 
+                 jobs_created, 's' if jobs_created > 1 else '', 
+                 request.prompt[:50], len(app.state.job_queue))
     
     return GenerationResponse(
         success=True,
@@ -293,9 +320,16 @@ def cli():
 @click.option('--port', default=DEFAULT_PORT, help='Port to bind server to')
 def server(host: str, port: int):
     """Run the image generation server"""
-    print(f"Starting server on {host}:{port}")
-    print("Model will be loaded and kept in memory for fast generation!")
-    print("Jobs will be processed in the background, even if clients disconnect.")
+    # Set up logging for server mode
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler()]
+    )
+    
+    click.echo(f"Starting server on {host}:{port}")
+    click.echo("Model will be loaded and kept in memory for fast generation!")
+    click.echo("Jobs will be processed in the background, even if clients disconnect.")
     uvicorn.run(app, host=host, port=port)
 
 @cli.command()
