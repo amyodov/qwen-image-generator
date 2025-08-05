@@ -52,6 +52,7 @@ class GenerationRequest(BaseModel):
     true_cfg_scale: float = 4.0
     seed: int = 42
     filename: Optional[str] = None
+    number: int = 1
 
 class StatusResponse(BaseModel):
     status: str
@@ -64,7 +65,7 @@ class StatusResponse(BaseModel):
 
 class GenerationResponse(BaseModel):
     success: bool
-    job_id: str
+    jobs_created: int
     message: str
 
 def scan_for_max_image_number(directory: str = "images") -> int:
@@ -251,32 +252,35 @@ async def get_status():
 
 @app.post("/generate", response_model=GenerationResponse)
 async def generate_image(request: GenerationRequest):
-    """Queue image generation job"""
+    """Queue image generation job(s)"""
     if not hasattr(app.state, 'pipeline') or app.state.pipeline is None:
         raise HTTPException(status_code=HTTPStatus.SERVICE_UNAVAILABLE, detail="Model not loaded")
     
-    # Create job
-    job = Job(
-        id=str(uuid.uuid4()),
-        prompt=request.prompt,
-        negative_prompt=request.negative_prompt,
-        aspect_ratio=request.aspect_ratio,
-        num_inference_steps=request.num_inference_steps,
-        true_cfg_scale=request.true_cfg_scale,
-        seed=request.seed,
-        filename=request.filename,
-        created_at=datetime.now()
-    )
+    # Create N jobs
+    jobs_created = 0
+    for i in range(request.number):
+        job = Job(
+            id=str(uuid.uuid4()),
+            prompt=request.prompt,
+            negative_prompt=request.negative_prompt,
+            aspect_ratio=request.aspect_ratio,
+            num_inference_steps=request.num_inference_steps,
+            true_cfg_scale=request.true_cfg_scale,
+            seed=request.seed,
+            filename=request.filename,
+            created_at=datetime.now()
+        )
+        
+        # Add to queue
+        app.state.job_queue.append(job)
+        jobs_created += 1
     
-    # Add to queue
-    app.state.job_queue.append(job)
-    
-    print(f"Queued job {job.id}: {job.prompt[:50]}... (Queue length: {len(app.state.job_queue)})")
+    print(f"Queued {jobs_created} job{'s' if jobs_created > 1 else ''}: {request.prompt[:50]}... (Queue length: {len(app.state.job_queue)})")
     
     return GenerationResponse(
         success=True,
-        job_id=job.id,
-        message=f"Job queued successfully. Queue position: {len(app.state.job_queue)}"
+        jobs_created=jobs_created,
+        message=f"{jobs_created} job{'s' if jobs_created > 1 else ''} queued successfully. Queue length: {len(app.state.job_queue)}"
     )
 
 @click.group()
@@ -303,8 +307,9 @@ def server(host: str, port: int):
 @click.option('--steps', default=50, help='Number of inference steps')
 @click.option('--cfg-scale', default=4.0, help='CFG scale')
 @click.option('--seed', default=42, help='Random seed')
+@click.option('-n', '--number', default=1, help='Number of images to generate')
 def generate(prompt: str, host: str, port: int, filename: Optional[str], aspect_ratio: str, 
-            steps: int, cfg_scale: float, seed: int):
+            steps: int, cfg_scale: float, seed: int, number: int):
     """Generate image using the server"""
     server_url = f"http://{host}:{port}"
     
@@ -321,14 +326,15 @@ def generate(prompt: str, host: str, port: int, filename: Optional[str], aspect_
                 click.echo("Server is not ready (model not loaded)")
                 sys.exit(1)
             
-            # Submit job
+            # Submit job(s)
             gen_request = {
                 "prompt": prompt,
                 "aspect_ratio": aspect_ratio,
                 "num_inference_steps": steps,
                 "true_cfg_scale": cfg_scale,
                 "seed": seed,
-                "filename": filename
+                "filename": filename,
+                "number": number
             }
             
             gen_response = client.post(f"{server_url}/generate", json=gen_request)
@@ -341,8 +347,6 @@ def generate(prompt: str, host: str, port: int, filename: Optional[str], aspect_
                 click.echo(f"Job submission failed: {result.get('message')}")
                 sys.exit(1)
             
-            job_id = result["job_id"]
-            click.echo(f"Job submitted: {job_id}")
             click.echo(result["message"])
             
     except httpx.ConnectError:
