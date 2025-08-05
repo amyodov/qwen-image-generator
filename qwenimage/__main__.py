@@ -6,6 +6,7 @@ import uuid
 import asyncio
 import threading
 import logging
+import random
 from collections import deque
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any
@@ -40,7 +41,7 @@ class Job(BaseModel):
     aspect_ratio: str = "16:9"
     num_inference_steps: int = 50
     true_cfg_scale: float = 4.0
-    seed: int = 42
+    seed: int
     filename: Optional[str] = None
     status: JobStatus = JobStatus.QUEUED
     created_at: datetime
@@ -55,7 +56,7 @@ class GenerationRequest(BaseModel):
     aspect_ratio: str = "16:9"
     num_inference_steps: int = 50
     true_cfg_scale: float = 4.0
-    seed: int = 42
+    seed: int
     filename: Optional[str] = None
     number: int = 1
 
@@ -340,10 +341,10 @@ def server(host: str, port: int):
 @click.option('--aspect-ratio', default='16:9', help='Image aspect ratio')
 @click.option('--steps', default=50, help='Number of inference steps')
 @click.option('--cfg-scale', default=4.0, help='CFG scale')
-@click.option('--seed', default=42, help='Random seed')
+@click.option('--seed', default=None, type=int, help='Random seed (random if not specified)')
 @click.option('-n', '--number', default=1, help='Number of images to generate')
 def generate(prompt: str, host: str, port: int, filename: Optional[str], aspect_ratio: str, 
-            steps: int, cfg_scale: float, seed: int, number: int):
+            steps: int, cfg_scale: float, seed: Optional[int], number: int):
     """Generate image using the server"""
     server_url = f"http://{host}:{port}"
     
@@ -359,6 +360,10 @@ def generate(prompt: str, host: str, port: int, filename: Optional[str], aspect_
             if not status_data.get("ready"):
                 click.echo("Server is not ready (model not loaded)")
                 sys.exit(1)
+            
+            # Generate random seed if not provided
+            if seed is None:
+                seed = random.randint(0, 2**32 - 1)
             
             # Submit job(s)
             gen_request = {
