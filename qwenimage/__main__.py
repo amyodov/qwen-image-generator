@@ -9,7 +9,7 @@ import logging
 import random
 from collections import deque
 from contextlib import asynccontextmanager
-from typing import Optional, Dict, Any
+from typing import Optional, Any
 from datetime import datetime
 from enum import Enum
 from http import HTTPStatus
@@ -33,6 +33,12 @@ class JobStatus(str, Enum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+
+class DeviceType(str, Enum):
+    AUTO = "auto"
+    CUDA = "cuda"
+    CPU = "cpu"
+    CPU_OFFLOAD = "cpu-offload"
 
 class Job(BaseModel):
     id: str
@@ -64,8 +70,8 @@ class StatusResponse(BaseModel):
     model_loaded: bool
     next_image_num: int
     queue_length: int
-    current_job: Optional[Dict[str, Any]] = None
-    recent_completed: list[Dict[str, Any]] = []
+    current_job: Optional[dict[str, Any]] = None
+    recent_completed: list[dict[str, Any]] = []
 
 class GenerationResponse(BaseModel):
     success: bool
@@ -76,7 +82,7 @@ def scan_for_max_image_number(directory: str = "images") -> int:
     """Scan directory for existing images and return the highest number found"""
     if not os.path.exists(directory):
         return 0
-    
+
     existing_files = [f for f in os.listdir(directory) if f.endswith(".png")]
     max_num = 0
     for filename in existing_files:
@@ -85,53 +91,60 @@ def scan_for_max_image_number(directory: str = "images") -> int:
             max_num = max(max_num, int(match.group(1)))
     return max_num
 
-def _cuda_worker_thread(job_queue: deque, completed_jobs: deque, app_state: Dict[str, Any]):
+def _cuda_worker_thread(job_queue: deque, completed_jobs: deque, app_state: dict[str, Any]):
     """CUDA worker thread - owns all GPU resources and operations"""
     try:
         # Determine actual device to use
-        requested = app_state.get("device_setting", "auto")
-        
-        if requested == "auto":
+        requested = app_state.get("device_setting", DeviceType.CPU_OFFLOAD.value)
+
+        if requested == DeviceType.AUTO.value:
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        elif requested == "cuda" and not torch.cuda.is_available():
+        elif requested == DeviceType.CUDA.value and not torch.cuda.is_available():
             raise RuntimeError("CUDA requested but not available")
+        elif requested == DeviceType.CPU_OFFLOAD.value:
+            device = "cuda" if torch.cuda.is_available() else "cpu"  # For logging/dtype purposes
         else:
             device = requested
-        
+
         torch_dtype = torch.bfloat16 if device == "cuda" else torch.float32
-        
-        logger.info("Loading model on %s in worker thread...", device)
+
+        logger.info("Loading model with device setting '%s' in worker thread...", requested)
         pipeline = DiffusionPipeline.from_pretrained(
             MODEL_NAME,
             torch_dtype=torch_dtype,
             cache_dir="./model_cache"
         )
-        pipeline = pipeline.to(device)
-        logger.info("Model loaded successfully on %s in worker thread!", device)
         
+        if requested == DeviceType.CPU_OFFLOAD.value:
+            pipeline.enable_model_cpu_offload()
+            logger.info("Model loaded successfully with CPU offload in worker thread!")
+        else:
+            pipeline = pipeline.to(device)
+            logger.info("Model loaded successfully on %s in worker thread!", device)
+
         # Signal main thread that we're ready
         app_state["cuda_ready"] = True
         app_state["device"] = device
-        
+
         # Process jobs forever
         while not app_state.get("shutdown", False):
             if len(job_queue) == 0:
                 threading.Event().wait(0.1)  # Small sleep
                 continue
-            
+
             # Get next job (thread-safe pop)
             try:
                 job = job_queue.popleft()
             except IndexError:
                 continue
-            
+
             # Update job status
             job.status = JobStatus.PROCESSING
             job.started_at = datetime.now()
             app_state["current_job"] = job
-            
+
             logger.info("Processing job %s: %s...", job.id, job.prompt[:50])
-            
+
             try:
                 # Aspect ratio mapping
                 aspect_ratios = {
@@ -141,27 +154,27 @@ def _cuda_worker_thread(job_queue: deque, completed_jobs: deque, app_state: Dict
                     "4:3": (1472, 1140),
                     "3:4": (1140, 1472)
                 }
-                
+
                 if job.aspect_ratio not in aspect_ratios:
                     raise ValueError(f"Unsupported aspect ratio: {job.aspect_ratio}")
-                
+
                 width, height = aspect_ratios[job.aspect_ratio]
                 positive_magic = "Ultra HD, 4K, cinematic composition."
                 full_prompt = f"{job.prompt} {positive_magic}"
-                
+
                 # Generate N images for this job
                 for i in range(job.number):
                     # Auto-generate filename and increment counter atomically
                     current_num = app_state["next_image_num"]
                     app_state["next_image_num"] += 1
                     filename = f"images/img{current_num:04d}.png"
-                    
+
                     # Use incremental seeds for multiple images
                     current_seed = job.seed + i
                     generator = torch.Generator(device=device).manual_seed(current_seed)
-                    
+
                     logger.debug("Generating image %d/%d with seed %d", i + 1, job.number, current_seed)
-                    
+
                     # Generate image
                     image = pipeline(
                         prompt=full_prompt,
@@ -172,29 +185,29 @@ def _cuda_worker_thread(job_queue: deque, completed_jobs: deque, app_state: Dict
                         true_cfg_scale=job.true_cfg_scale,
                         generator=generator
                     ).images[0]
-                    
+
                     # Save image to disk
                     os.makedirs(os.path.dirname(filename), exist_ok=True)
                     image.save(filename)
-                    
+
                     logger.debug("Saved image %d/%d: %s", i + 1, job.number, filename)
-                
+
                 # Mark job as completed
                 job.status = JobStatus.COMPLETED
                 job.completed_at = datetime.now()
-                
+
                 logger.info("Job %s completed: generated %d image%s", job.id, job.number, 's' if job.number > 1 else '')
-                
+
             except Exception as e:
                 job.status = JobStatus.FAILED
                 job.completed_at = datetime.now()
                 job.error_message = str(e)
                 logger.exception("Job %s failed", job.id)
-            
+
             # Move to completed jobs (keep last 10)
             completed_jobs.append(job)
             app_state["current_job"] = None
-            
+
     except Exception as e:
         logger.exception("Worker thread failed")
         app_state["cuda_ready"] = False
@@ -205,7 +218,7 @@ async def lifespan(app: FastAPI):
     # Initialize shared state
     os.makedirs("images", exist_ok=True)
     max_num = scan_for_max_image_number("images")
-    
+
     # Thread-safe collections and shared state
     job_queue = deque()
     completed_jobs = deque(maxlen=10)
@@ -217,27 +230,27 @@ async def lifespan(app: FastAPI):
         "shutdown": False,
         "device_setting": app.state.device_setting
     }
-    
+
     logger.info("Next image will be: img%04d.png", shared_state['next_image_num'])
-    
+
     # Store in app state for FastAPI endpoints
     app.state.job_queue = job_queue
     app.state.completed_jobs = completed_jobs
     app.state.shared_state = shared_state
-    
+
     # Start CUDA worker thread
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cuda-worker")
     cuda_future = executor.submit(_cuda_worker_thread, job_queue, completed_jobs, shared_state)
-    
+
     # Wait for CUDA thread to signal readiness
     logger.info("Waiting for worker thread to load model...")
     while not shared_state.get("cuda_ready", False):
         await asyncio.sleep(0.1)
-    
+
     logger.info("Worker thread ready!")
-    
+
     yield
-    
+
     # Shutdown: stop CUDA worker thread
     logger.info("Shutting down worker thread...")
     shared_state["shutdown"] = True
@@ -250,7 +263,7 @@ app = FastAPI(title="Qwen Image Generator", version="0.1.0", lifespan=lifespan)
 async def get_status():
     """Get server status including queue information"""
     shared_state = app.state.shared_state
-    
+
     current_job_info = None
     current_job = shared_state.get("current_job")
     if current_job:
@@ -260,7 +273,7 @@ async def get_status():
             "started_at": current_job.started_at.isoformat() if current_job.started_at else None,
             "status": current_job.status
         }
-    
+
     recent_completed = []
     for job in list(app.state.completed_jobs)[-5:]:  # Last 5 completed jobs
         recent_completed.append({
@@ -271,7 +284,7 @@ async def get_status():
             "completed_at": job.completed_at.isoformat() if job.completed_at else None,
             "error_message": job.error_message
         })
-    
+
     return StatusResponse(
         status="running",
         ready=shared_state.get("cuda_ready", False),
@@ -287,7 +300,7 @@ async def generate_image(request: GenerationRequest):
     """Queue image generation job(s)"""
     if not app.state.shared_state.get("cuda_ready", False):
         raise HTTPException(status_code=HTTPStatus.SERVICE_UNAVAILABLE, detail="Model not loaded")
-    
+
     # Create single job for N images
     job = Job(
         id=str(uuid.uuid4()),
@@ -300,14 +313,14 @@ async def generate_image(request: GenerationRequest):
         number=request.number,
         created_at=datetime.now()
     )
-    
+
     # Add to queue
     app.state.job_queue.append(job)
-    
-    logger.debug("Queued job for %d image%s: %s... (Queue length: %d)", 
-                 request.number, 's' if request.number > 1 else '', 
+
+    logger.debug("Queued job for %d image%s: %s... (Queue length: %d)",
+                 request.number, 's' if request.number > 1 else '',
                  request.prompt[:50], len(app.state.job_queue))
-    
+
     return GenerationResponse(
         success=True,
         jobs_created=1,
@@ -322,7 +335,7 @@ def cli():
 @cli.command()
 @click.option('--host', default=DEFAULT_HOST, help='Host to bind server to')
 @click.option('--port', default=DEFAULT_PORT, help='Port to bind server to')
-@click.option('-d', '--device', default='auto', type=click.Choice(['auto', 'cuda', 'cpu']), help='Device to use for inference')
+@click.option('-d', '--device', default=DeviceType.CPU_OFFLOAD.value, type=click.Choice([e.value for e in DeviceType]), help='Device to use for inference')
 def server(host: str, port: int, device: str):
     """Run the image generation server"""
     # Set up logging for server mode
@@ -331,10 +344,10 @@ def server(host: str, port: int, device: str):
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[logging.StreamHandler()]
     )
-    
+
     # Store device setting in app state
     app.state.device_setting = device
-    
+
     click.echo(f"Starting server on {host}:{port}")
     click.echo(f"Device setting: {device}")
     click.echo("Model will be loaded and kept in memory for fast generation!")
@@ -350,11 +363,11 @@ def server(host: str, port: int, device: str):
 @click.option('--cfg-scale', default=4.0, help='CFG scale')
 @click.option('--seed', default=None, type=int, help='Random seed (random if not specified)')
 @click.option('-n', '--number', default=1, help='Number of images to generate')
-def generate(prompt: str, host: str, port: int, aspect_ratio: str, 
+def generate(prompt: str, host: str, port: int, aspect_ratio: str,
             steps: int, cfg_scale: float, seed: Optional[int], number: int):
     """Generate image using the server"""
     server_url = f"http://{host}:{port}"
-    
+
     try:
         with httpx.Client() as client:
             # Check server status
@@ -362,16 +375,16 @@ def generate(prompt: str, host: str, port: int, aspect_ratio: str,
             if status_response.status_code != HTTPStatus.OK:
                 click.echo(f"Server not responding at {server_url}")
                 sys.exit(1)
-            
+
             status_data = status_response.json()
             if not status_data.get("ready"):
                 click.echo("Server is not ready (model not loaded)")
                 sys.exit(1)
-            
+
             # Generate random seed if not provided
             if seed is None:
                 seed = random.randint(0, 2**32 - 1)
-            
+
             # Submit job(s)
             gen_request = {
                 "prompt": prompt,
@@ -381,19 +394,19 @@ def generate(prompt: str, host: str, port: int, aspect_ratio: str,
                 "seed": seed,
                 "number": number
             }
-            
+
             gen_response = client.post(f"{server_url}/generate", json=gen_request)
             if gen_response.status_code != HTTPStatus.OK:
                 click.echo(f"Job submission failed: {gen_response.text}")
                 sys.exit(1)
-            
+
             result = gen_response.json()
             if not result.get("success"):
                 click.echo(f"Job submission failed: {result.get('message')}")
                 sys.exit(1)
-            
+
             click.echo(result["message"])
-            
+
     except httpx.ConnectError:
         click.echo(f"Cannot connect to server at {server_url}")
         click.echo("Make sure the server is running with: python -m qwenimage server")
@@ -408,29 +421,29 @@ def generate(prompt: str, host: str, port: int, aspect_ratio: str,
 def status(host: str, port: int):
     """Check server status and queue information"""
     server_url = f"http://{host}:{port}"
-    
+
     try:
         with httpx.Client() as client:
             response = client.get(f"{server_url}/status")
             if response.status_code != HTTPStatus.OK:
                 click.echo(f"Server not responding at {server_url}")
                 sys.exit(1)
-            
+
             data = response.json()
-            
+
             click.echo(f"Server Status: {data['status']}")
             click.echo(f"Model Loaded: {data['model_loaded']}")
             click.echo(f"Ready: {data['ready']}")
             click.echo(f"Next Image Number: {data['next_image_num']}")
             click.echo(f"Queue Length: {data['queue_length']}")
-            
+
             current_job = data.get('current_job')
             if current_job:
                 click.echo(f"\nCurrent Job:")
                 click.echo(f"  ID: {current_job['id']}")
                 click.echo(f"  Prompt: {current_job['prompt']}")
                 click.echo(f"  Started: {current_job['started_at']}")
-            
+
             recent = data.get('recent_completed', [])
             if recent:
                 click.echo(f"\nRecent Completed Jobs:")
@@ -441,7 +454,7 @@ def status(host: str, port: int):
                         click.echo(f"    -> Generated {job['number']} image{'s' if job['number'] > 1 else ''}")
                     elif job['error_message']:
                         click.echo(f"    -> Error: {job['error_message']}")
-                        
+
     except httpx.ConnectError:
         click.echo(f"Cannot connect to server at {server_url}")
         sys.exit(1)

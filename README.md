@@ -19,6 +19,7 @@ The original model contains the suggested Python code to startup, setup the pipe
   * The image directory is automatically generated for you, if missing.
   * The file names are auto-incremented, and don't block each other.
   * The communication IP port is has the same defaults both for client and server (so you don't need to mention it explicitly); you can still configure it if needed.
+* CPU offloading support (enabled by default), to use the model on GPUs with insufficient VRAM, and still run reasonably efficiently.
 
 ## Installation
 
