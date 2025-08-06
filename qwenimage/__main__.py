@@ -88,13 +88,17 @@ def scan_for_max_image_number(directory: str = "images") -> int:
 def _cuda_worker_thread(job_queue: deque, completed_jobs: deque, app_state: Dict[str, Any]):
     """CUDA worker thread - owns all GPU resources and operations"""
     try:
-        # Load pipeline in this thread
-        if torch.cuda.is_available():
-            torch_dtype = torch.bfloat16
-            device = "cuda"
+        # Determine actual device to use
+        requested = app_state.get("device_setting", "auto")
+        
+        if requested == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        elif requested == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA requested but not available")
         else:
-            torch_dtype = torch.float32
-            device = "cpu"
+            device = requested
+        
+        torch_dtype = torch.bfloat16 if device == "cuda" else torch.float32
         
         logger.info("Loading model on %s in worker thread...", device)
         pipeline = DiffusionPipeline.from_pretrained(
@@ -210,7 +214,8 @@ async def lifespan(app: FastAPI):
         "cuda_ready": False,
         "device": None,
         "current_job": None,
-        "shutdown": False
+        "shutdown": False,
+        "device_setting": app.state.device_setting
     }
     
     logger.info("Next image will be: img%04d.png", shared_state['next_image_num'])
@@ -317,7 +322,8 @@ def cli():
 @cli.command()
 @click.option('--host', default=DEFAULT_HOST, help='Host to bind server to')
 @click.option('--port', default=DEFAULT_PORT, help='Port to bind server to')
-def server(host: str, port: int):
+@click.option('-d', '--device', default='auto', type=click.Choice(['auto', 'cuda', 'cpu']), help='Device to use for inference')
+def server(host: str, port: int, device: str):
     """Run the image generation server"""
     # Set up logging for server mode
     logging.basicConfig(
@@ -326,7 +332,11 @@ def server(host: str, port: int):
         handlers=[logging.StreamHandler()]
     )
     
+    # Store device setting in app state
+    app.state.device_setting = device
+    
     click.echo(f"Starting server on {host}:{port}")
+    click.echo(f"Device setting: {device}")
     click.echo("Model will be loaded and kept in memory for fast generation!")
     click.echo("Jobs will be processed in the background, even if clients disconnect.")
     uvicorn.run(app, host=host, port=port)
