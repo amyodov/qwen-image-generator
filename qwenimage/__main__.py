@@ -356,14 +356,15 @@ def server(host: str, port: int, device: str):
 
 @cli.command()
 @click.argument('prompt')
-@click.option('--host', default=DEFAULT_HOST, help='Server host')
-@click.option('--port', default=DEFAULT_PORT, help='Server port')
-@click.option('--aspect-ratio', default='16:9', help='Image aspect ratio')
+@click.option('-h', '--host', default=DEFAULT_HOST, help='Server host')
+@click.option('-p', '--port', default=DEFAULT_PORT, help='Server port')
+@click.option('-neg', '--negative-prompt', default=' ', help='Negative prompt to avoid certain features')
+@click.option('-ar', '--aspect-ratio', default='16:9', help='Image aspect ratio')
 @click.option('--steps', default=50, help='Number of inference steps')
 @click.option('--cfg-scale', default=4.0, help='CFG scale')
 @click.option('--seed', default=None, type=int, help='Random seed (random if not specified)')
 @click.option('-n', '--number', default=1, help='Number of images to generate')
-def generate(prompt: str, host: str, port: int, aspect_ratio: str,
+def generate(prompt: str, host: str, port: int, negative_prompt: str, aspect_ratio: str,
             steps: int, cfg_scale: float, seed: Optional[int], number: int):
     """Generate image using the server"""
     server_url = f"http://{host}:{port}"
@@ -388,6 +389,7 @@ def generate(prompt: str, host: str, port: int, aspect_ratio: str,
             # Submit job(s)
             gen_request = {
                 "prompt": prompt,
+                "negative_prompt": negative_prompt,
                 "aspect_ratio": aspect_ratio,
                 "num_inference_steps": steps,
                 "true_cfg_scale": cfg_scale,
